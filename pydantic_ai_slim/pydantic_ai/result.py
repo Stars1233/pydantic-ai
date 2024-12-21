@@ -4,31 +4,48 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Generic, TypeVar, cast
+from typing import Generic, Union, cast
 
 import logfire_api
+from typing_extensions import TypeVar
 
 from . import _result, _utils, exceptions, messages as _messages, models
 from .settings import UsageLimits
-from .tools import AgentDeps
+from .tools import AgentDeps, RunContext
 
 __all__ = (
     'ResultData',
+    'ResultValidatorFunc',
     'Usage',
     'RunResult',
     'StreamedRunResult',
 )
 
 
-ResultData = TypeVar('ResultData')
+ResultData = TypeVar('ResultData', default=str)
 """Type variable for the result data of a run."""
+
+ResultValidatorFunc = Union[
+    Callable[[RunContext[AgentDeps], ResultData], ResultData],
+    Callable[[RunContext[AgentDeps], ResultData], Awaitable[ResultData]],
+    Callable[[ResultData], ResultData],
+    Callable[[ResultData], Awaitable[ResultData]],
+]
+"""
+A function that always takes `ResultData` and returns `ResultData` and:
+
+* may or may not take [`RunContext`][pydantic_ai.tools.RunContext] as a first argument
+* may or may not be async
+
+Usage `ResultValidatorFunc[AgentDeps, ResultData]`.
+"""
 
 _logfire = logfire_api.Logfire(otel_scope='pydantic-ai')
 
 
 @dataclass
 class Usage:
-    """LLM usage associated to a request or run.
+    """LLM usage associated with a request or run.
 
     Responsibility for calculating usage is on the model; PydanticAI simply sums the usage information across requests.
 
@@ -36,7 +53,7 @@ class Usage:
     """
 
     requests: int = 0
-    """Number of requests made."""
+    """Number of requests made to the LLM API."""
     request_tokens: int | None = None
     """Tokens used in processing requests."""
     response_tokens: int | None = None
@@ -124,7 +141,7 @@ class StreamedRunResult(_BaseRunResult[ResultData], Generic[AgentDeps, ResultDat
     _usage_limits: UsageLimits | None
     _stream_response: models.EitherStreamedResponse
     _result_schema: _result.ResultSchema[ResultData] | None
-    _deps: AgentDeps
+    _run_ctx: RunContext[AgentDeps]
     _result_validators: list[_result.ResultValidator[AgentDeps, ResultData]]
     _result_tool_name: str | None
     _on_complete: Callable[[], Awaitable[None]]
@@ -311,17 +328,15 @@ class StreamedRunResult(_BaseRunResult[ResultData], Generic[AgentDeps, ResultDat
         result_data = result_tool.validate(call, allow_partial=allow_partial, wrap_validation_errors=False)
 
         for validator in self._result_validators:
-            result_data = await validator.validate(result_data, self._deps, 0, call, self._all_messages)
+            result_data = await validator.validate(result_data, call, self._run_ctx)
         return result_data
 
     async def _validate_text_result(self, text: str) -> str:
         for validator in self._result_validators:
             text = await validator.validate(  # pyright: ignore[reportAssignmentType]
                 text,  # pyright: ignore[reportArgumentType]
-                self._deps,
-                0,
                 None,
-                self._all_messages,
+                self._run_ctx,
             )
         return text
 
