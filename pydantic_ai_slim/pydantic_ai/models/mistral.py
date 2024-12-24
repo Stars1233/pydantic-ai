@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from itertools import chain
 from typing import Any, Callable, Literal, Union
 
+import pydantic_core
 from httpx import AsyncClient as AsyncHTTPClient, Timeout
 from typing_extensions import assert_never
 
@@ -39,7 +40,6 @@ from . import (
 )
 
 try:
-    from json_repair import repair_json
     from mistralai import (
         UNSET,
         CompletionChunk as MistralCompletionChunk,
@@ -198,11 +198,10 @@ class MistralAgentModel(AgentModel):
         """Create a streaming completion request to the Mistral model."""
         response: MistralEventStreamAsync[MistralCompletionEvent] | None
         mistral_messages = list(chain(*(self._map_message(m) for m in messages)))
-
         model_settings = model_settings or {}
 
         if self.result_tools and self.function_tools or self.function_tools:
-            # Function Calling Mode
+            # Function Calling
             response = await self.client.chat.stream_async(
                 model=str(self.model_name),
                 messages=mistral_messages,
@@ -218,9 +217,9 @@ class MistralAgentModel(AgentModel):
         elif self.result_tools:
             # Json Mode
             parameters_json_schemas = [tool.parameters_json_schema for tool in self.result_tools]
-
             user_output_format_message = self._generate_user_output_format(parameters_json_schemas)
             mistral_messages.append(user_output_format_message)
+
             response = await self.client.chat.stream_async(
                 model=str(self.model_name),
                 messages=mistral_messages,
@@ -270,12 +269,13 @@ class MistralAgentModel(AgentModel):
     @staticmethod
     def _process_response(response: MistralChatCompletionResponse) -> ModelResponse:
         """Process a non-streamed response, and prepare a message to return."""
+        assert response.choices, 'Unexpected empty response choice.'
+
         if response.created:
             timestamp = datetime.fromtimestamp(response.created, tz=timezone.utc)
         else:
             timestamp = _now_utc()
 
-        assert response.choices, 'Unexpected empty response choice.'
         choice = response.choices[0]
         content = choice.message.content
         tool_calls = choice.message.tool_calls
@@ -546,27 +546,19 @@ class MistralStreamStructuredResponse(StreamStructuredResponse):
                 calls.append(tool)
 
         elif self._delta_content and self._result_tools:
-            # NOTE: Params set for the most efficient and fastest way.
-            output_json = repair_json(self._delta_content, return_objects=True, skip_json_loads=True)
-            assert isinstance(
-                output_json, dict
-            ), f'Expected repair_json as type dict, invalid type: {type(output_json)}'
+            output_json: dict[str, Any] | None = pydantic_core.from_json(
+                self._delta_content, allow_partial='trailing-strings'
+            )
 
             if output_json:
                 for result_tool in self._result_tools.values():
-                    # NOTE: Additional verification to prevent JSON validation to crash in `result.py`
+                    # NOTE: Additional verification to prevent JSON validation to crash in `_result.py`
                     # Ensures required parameters in the JSON schema are respected, especially for stream-based return types.
-                    # For example, `return_type=list[str]` expects a 'response' key with value type array of str.
-                    # when `{"response":` then `repair_json` sets `{"response": ""}` (type not found default str)
-                    # when `{"response": {` then `repair_json` sets `{"response": {}}` (type found)
-                    # This ensures it's corrected to `{"response": {}}` and other required parameters and type.
-                    if not self._validate_required_json_shema(output_json, result_tool.parameters_json_schema):
+                    # Example with BaseModel and required fields.
+                    if not self._validate_required_json_schema(output_json, result_tool.parameters_json_schema):
                         continue
 
-                    tool = ToolCallPart.from_dict(
-                        tool_name=result_tool.name,
-                        args_dict=output_json,
-                    )
+                    tool = ToolCallPart.from_raw_args(result_tool.name, output_json)
                     calls.append(tool)
 
         return ModelResponse(calls, timestamp=self._timestamp)
@@ -578,7 +570,7 @@ class MistralStreamStructuredResponse(StreamStructuredResponse):
         return self._timestamp
 
     @staticmethod
-    def _validate_required_json_shema(json_dict: dict[str, Any], json_schema: dict[str, Any]) -> bool:
+    def _validate_required_json_schema(json_dict: dict[str, Any], json_schema: dict[str, Any]) -> bool:
         """Validate that all required parameters in the JSON schema are present in the JSON dictionary."""
         required_params = json_schema.get('required', [])
         properties = json_schema.get('properties', {})
@@ -602,7 +594,7 @@ class MistralStreamStructuredResponse(StreamStructuredResponse):
 
             if isinstance(json_dict[param], dict) and 'properties' in param_schema:
                 nested_schema = param_schema
-                if not MistralStreamStructuredResponse._validate_required_json_shema(json_dict[param], nested_schema):
+                if not MistralStreamStructuredResponse._validate_required_json_schema(json_dict[param], nested_schema):
                     return False
 
         return True
@@ -633,16 +625,7 @@ def _map_mistral_to_pydantic_tool_call(tool_call: MistralToolCall) -> ToolCallPa
     tool_call_id = tool_call.id or None
     func_call = tool_call.function
 
-    if isinstance(func_call.arguments, str):
-        return ToolCallPart.from_json(
-            tool_name=func_call.name,
-            args_json=func_call.arguments,
-            tool_call_id=tool_call_id,
-        )
-    else:
-        return ToolCallPart.from_dict(
-            tool_name=func_call.name, args_dict=func_call.arguments, tool_call_id=tool_call_id
-        )
+    return ToolCallPart.from_raw_args(func_call.name, func_call.arguments, tool_call_id)
 
 
 def _map_usage(response: MistralChatCompletionResponse | MistralCompletionChunk) -> Usage:

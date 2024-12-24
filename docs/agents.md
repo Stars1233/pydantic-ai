@@ -7,13 +7,16 @@ but multiple agents can also interact to embody more complex workflows.
 
 The [`Agent`][pydantic_ai.Agent] class has full API documentation, but conceptually you can think of an agent as a container for:
 
-* A [system prompt](#system-prompts) — a set of instructions for the LLM written by the developer
-* One or more [function tool](tools.md) — functions that the LLM may call to get information while generating a response
-* An optional structured [result type](results.md) — the structured datatype the LLM must return at the end of a run
-* A [dependency](dependencies.md) type constraint — system prompt functions, tools and result validators may all use dependencies when they're run
-* Agents may optionally also have a default [LLM model](api/models/base.md) associated with them; the model to use can also be specified when running the agent
+| **Component**                                   | **Description**                                                                                          |
+|-------------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| [System prompt(s)](#system-prompts)             | A set of instructions for the LLM written by the developer.                                              |
+| [Function tool(s)](tools.md)                    | Functions that the LLM may call to get information while generating a response.                          |
+| [Structured result type](results.md)            | The structured datatype the LLM must return at the end of a run, if specified.                           |
+| [Dependency type constraint](dependencies.md)   | System prompt functions, tools, and result validators may all use dependencies when they're run.         |
+| [LLM model](api/models/base.md)                 | Optional default LLM model associated with the agent. Can also be specified when running the agent.      |
+| [Model Settings](#additional-configuration)     | Optional default model settings to help fine tune requests. Can also be specified when running the agent.|
 
-In typing terms, agents are generic in their dependency and result types, e.g., an agent which required dependencies of type `#!python Foobar` and returned results of type `#!python list[str]` would have type `cAgent[Foobar, list[str]]`. In practice, you shouldn't need to care about this, it should just mean your IDE can tell you when you have the right type, and if you choose to use [static type checking](#static-type-checking) it should work well with PydanticAI.
+In typing terms, agents are generic in their dependency and result types, e.g., an agent which required dependencies of type `#!python Foobar` and returned results of type `#!python list[str]` would have type `Agent[Foobar, list[str]]`. In practice, you shouldn't need to care about this, it should just mean your IDE can tell you when you have the right type, and if you choose to use [static type checking](#static-type-checking) it should work well with PydanticAI.
 
 Here's a toy example of an agent that simulates a roulette wheel:
 
@@ -248,7 +251,7 @@ PydanticAI is designed to work well with static type checkers, like mypy and pyr
 
     That said, because PydanticAI uses Pydantic, and Pydantic uses type hints as the definition for schema and validation, some types (specifically type hints on parameters to tools, and the `result_type` arguments to [`Agent`][pydantic_ai.Agent]) are used at runtime.
 
-    We (the library developers) have messed up if type hints are confusing you more than they're help you, if you find this, please create an [issue](https://github.com/pydantic/pydantic-ai/issues) explaining what's annoying you!
+    We (the library developers) have messed up if type hints are confusing you more than helping you, if you find this, please create an [issue](https://github.com/pydantic/pydantic-ai/issues) explaining what's annoying you!
 
 In particular, agents are generic in both the type of their dependencies and the type of results they return, so you can use the type hints to ensure you're using the right types.
 
@@ -405,10 +408,10 @@ user_id=123 message='Hello John, would you be free for coffee sometime next week
 
 If models behave unexpectedly (e.g., the retry limit is exceeded, or their API returns `503`), agent runs will raise [`UnexpectedModelBehavior`][pydantic_ai.exceptions.UnexpectedModelBehavior].
 
-In these cases, [`agent.last_run_messages`][pydantic_ai.Agent.last_run_messages] can be used to access the messages exchanged during the run to help diagnose the issue.
+In these cases, [`capture_run_messages`][pydantic_ai.capture_run_messages] can be used to access the messages exchanged during the run to help diagnose the issue.
 
 ```python
-from pydantic_ai import Agent, ModelRetry, UnexpectedModelBehavior
+from pydantic_ai import Agent, ModelRetry, UnexpectedModelBehavior, capture_run_messages
 
 agent = Agent('openai:gpt-4o')
 
@@ -421,68 +424,76 @@ def calc_volume(size: int) -> int:  # (1)!
         raise ModelRetry('Please try again.')
 
 
-try:
-    result = agent.run_sync('Please get me the volume of a box with size 6.')
-except UnexpectedModelBehavior as e:
-    print('An error occurred:', e)
-    #> An error occurred: Tool exceeded max retries count of 1
-    print('cause:', repr(e.__cause__))
-    #> cause: ModelRetry('Please try again.')
-    print('messages:', agent.last_run_messages)
-    """
-    messages:
-    [
-        ModelRequest(
-            parts=[
-                UserPromptPart(
-                    content='Please get me the volume of a box with size 6.',
-                    timestamp=datetime.datetime(...),
-                    part_kind='user-prompt',
-                )
-            ],
-            kind='request',
-        ),
-        ModelResponse(
-            parts=[
-                ToolCallPart(
-                    tool_name='calc_volume',
-                    args=ArgsDict(args_dict={'size': 6}),
-                    tool_call_id=None,
-                    part_kind='tool-call',
-                )
-            ],
-            timestamp=datetime.datetime(...),
-            kind='response',
-        ),
-        ModelRequest(
-            parts=[
-                RetryPromptPart(
-                    content='Please try again.',
-                    tool_name='calc_volume',
-                    tool_call_id=None,
-                    timestamp=datetime.datetime(...),
-                    part_kind='retry-prompt',
-                )
-            ],
-            kind='request',
-        ),
-        ModelResponse(
-            parts=[
-                ToolCallPart(
-                    tool_name='calc_volume',
-                    args=ArgsDict(args_dict={'size': 6}),
-                    tool_call_id=None,
-                    part_kind='tool-call',
-                )
-            ],
-            timestamp=datetime.datetime(...),
-            kind='response',
-        ),
-    ]
-    """
-else:
-    print(result.data)
+with capture_run_messages() as messages:  # (2)!
+    try:
+        result = agent.run_sync('Please get me the volume of a box with size 6.')
+    except UnexpectedModelBehavior as e:
+        print('An error occurred:', e)
+        #> An error occurred: Tool exceeded max retries count of 1
+        print('cause:', repr(e.__cause__))
+        #> cause: ModelRetry('Please try again.')
+        print('messages:', messages)
+        """
+        messages:
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Please get me the volume of a box with size 6.',
+                        timestamp=datetime.datetime(...),
+                        part_kind='user-prompt',
+                    )
+                ],
+                kind='request',
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='calc_volume',
+                        args=ArgsDict(args_dict={'size': 6}),
+                        tool_call_id=None,
+                        part_kind='tool-call',
+                    )
+                ],
+                timestamp=datetime.datetime(...),
+                kind='response',
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='Please try again.',
+                        tool_name='calc_volume',
+                        tool_call_id=None,
+                        timestamp=datetime.datetime(...),
+                        part_kind='retry-prompt',
+                    )
+                ],
+                kind='request',
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='calc_volume',
+                        args=ArgsDict(args_dict={'size': 6}),
+                        tool_call_id=None,
+                        part_kind='tool-call',
+                    )
+                ],
+                timestamp=datetime.datetime(...),
+                kind='response',
+            ),
+        ]
+        """
+    else:
+        print(result.data)
 ```
+
 1. Define a tool that will raise `ModelRetry` repeatedly in this case.
+2. [`capture_run_messages`][pydantic_ai.capture_run_messages] is used to capture the messages exchanged during the run.
 
 _(This example is complete, it can be run "as is")_
+
+!!! note
+    You may not call [`run`][pydantic_ai.Agent.run], [`run_sync`][pydantic_ai.Agent.run_sync], or [`run_stream`][pydantic_ai.Agent.run_stream] more than once within a single `capture_run_messages` context.
+
+    If you try to do so, a [`UserError`][pydantic_ai.exceptions.UserError] will be raised.

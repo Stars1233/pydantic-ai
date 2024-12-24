@@ -2,33 +2,51 @@ from __future__ import annotations as _annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
+from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Generic, TypeVar, cast
+from typing import Generic, Union, cast
 
 import logfire_api
+from typing_extensions import TypeVar
 
 from . import _result, _utils, exceptions, messages as _messages, models
 from .settings import UsageLimits
-from .tools import AgentDeps
+from .tools import AgentDeps, RunContext
 
 __all__ = (
     'ResultData',
+    'ResultValidatorFunc',
     'Usage',
     'RunResult',
     'StreamedRunResult',
 )
 
 
-ResultData = TypeVar('ResultData')
+ResultData = TypeVar('ResultData', default=str)
 """Type variable for the result data of a run."""
+
+ResultValidatorFunc = Union[
+    Callable[[RunContext[AgentDeps], ResultData], ResultData],
+    Callable[[RunContext[AgentDeps], ResultData], Awaitable[ResultData]],
+    Callable[[ResultData], ResultData],
+    Callable[[ResultData], Awaitable[ResultData]],
+]
+"""
+A function that always takes `ResultData` and returns `ResultData` and:
+
+* may or may not take [`RunContext`][pydantic_ai.tools.RunContext] as a first argument
+* may or may not be async
+
+Usage `ResultValidatorFunc[AgentDeps, ResultData]`.
+"""
 
 _logfire = logfire_api.Logfire(otel_scope='pydantic-ai')
 
 
 @dataclass
 class Usage:
-    """LLM usage associated to a request or run.
+    """LLM usage associated with a request or run.
 
     Responsibility for calculating usage is on the model; PydanticAI simply sums the usage information across requests.
 
@@ -36,7 +54,7 @@ class Usage:
     """
 
     requests: int = 0
-    """Number of requests made."""
+    """Number of requests made to the LLM API."""
     request_tokens: int | None = None
     """Tokens used in processing requests."""
     response_tokens: int | None = None
@@ -46,25 +64,33 @@ class Usage:
     details: dict[str, int] | None = None
     """Any extra details returned by the model."""
 
+    def incr(self, incr_usage: Usage, *, requests: int = 0) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+            requests: The number of requests to increment by in addition to `incr_usage.requests`.
+        """
+        self.requests += requests
+        for f in 'requests', 'request_tokens', 'response_tokens', 'total_tokens':
+            self_value = getattr(self, f)
+            other_value = getattr(incr_usage, f)
+            if self_value is not None or other_value is not None:
+                setattr(self, f, (self_value or 0) + (other_value or 0))
+
+        if incr_usage.details:
+            self.details = self.details or {}
+            for key, value in incr_usage.details.items():
+                self.details[key] = self.details.get(key, 0) + value
+
     def __add__(self, other: Usage) -> Usage:
         """Add two Usages together.
 
         This is provided so it's trivial to sum usage information from multiple requests and runs.
         """
-        counts: dict[str, int] = {}
-        for f in 'requests', 'request_tokens', 'response_tokens', 'total_tokens':
-            self_value = getattr(self, f)
-            other_value = getattr(other, f)
-            if self_value is not None or other_value is not None:
-                counts[f] = (self_value or 0) + (other_value or 0)
-
-        details = self.details.copy() if self.details is not None else None
-        if other.details is not None:
-            details = details or {}
-            for key, value in other.details.items():
-                details[key] = details.get(key, 0) + value
-
-        return Usage(**counts, details=details or None)
+        new_usage = copy(self)
+        new_usage.incr(other)
+        return new_usage
 
 
 @dataclass
@@ -119,12 +145,10 @@ class RunResult(_BaseRunResult[ResultData]):
 class StreamedRunResult(_BaseRunResult[ResultData], Generic[AgentDeps, ResultData]):
     """Result of a streamed run that returns structured data via a tool call."""
 
-    usage_so_far: Usage
-    """Usage of the run up until the last request."""
     _usage_limits: UsageLimits | None
     _stream_response: models.EitherStreamedResponse
     _result_schema: _result.ResultSchema[ResultData] | None
-    _deps: AgentDeps
+    _run_ctx: RunContext[AgentDeps]
     _result_validators: list[_result.ResultValidator[AgentDeps, ResultData]]
     _result_tool_name: str | None
     _on_complete: Callable[[], Awaitable[None]]
@@ -289,7 +313,7 @@ class StreamedRunResult(_BaseRunResult[ResultData], Generic[AgentDeps, ResultDat
         !!! note
             This won't return the full usage until the stream is finished.
         """
-        return self.usage_so_far + self._stream_response.usage()
+        return self._run_ctx.usage + self._stream_response.usage()
 
     def timestamp(self) -> datetime:
         """Get the timestamp of the response."""
@@ -311,17 +335,15 @@ class StreamedRunResult(_BaseRunResult[ResultData], Generic[AgentDeps, ResultDat
         result_data = result_tool.validate(call, allow_partial=allow_partial, wrap_validation_errors=False)
 
         for validator in self._result_validators:
-            result_data = await validator.validate(result_data, self._deps, 0, call, self._all_messages)
+            result_data = await validator.validate(result_data, call, self._run_ctx)
         return result_data
 
     async def _validate_text_result(self, text: str) -> str:
         for validator in self._result_validators:
             text = await validator.validate(  # pyright: ignore[reportAssignmentType]
                 text,  # pyright: ignore[reportArgumentType]
-                self._deps,
-                0,
                 None,
-                self._all_messages,
+                self._run_ctx,
             )
         return text
 

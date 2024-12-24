@@ -16,7 +16,6 @@ from typing_extensions import NotRequired, TypedDict, TypeGuard, assert_never
 
 from .. import UnexpectedModelBehavior, _utils, exceptions, result
 from ..messages import (
-    ArgsDict,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -460,8 +459,7 @@ class _GeminiFunctionCallPart(TypedDict):
 
 
 def _function_call_part_from_call(tool: ToolCallPart) -> _GeminiFunctionCallPart:
-    assert isinstance(tool.args, ArgsDict), f'Expected ArgsObject, got {tool.args}'
-    return _GeminiFunctionCallPart(function_call=_GeminiFunctionCall(name=tool.tool_name, args=tool.args.args_dict))
+    return _GeminiFunctionCallPart(function_call=_GeminiFunctionCall(name=tool.tool_name, args=tool.args_as_dict()))
 
 
 def _process_response_from_parts(parts: Sequence[_GeminiPartUnion], timestamp: datetime | None = None) -> ModelResponse:
@@ -470,7 +468,7 @@ def _process_response_from_parts(parts: Sequence[_GeminiPartUnion], timestamp: d
         if 'text' in part:
             items.append(TextPart(part['text']))
         elif 'function_call' in part:
-            items.append(ToolCallPart.from_dict(part['function_call']['name'], part['function_call']['args']))
+            items.append(ToolCallPart.from_raw_args(part['function_call']['name'], part['function_call']['args']))
         elif 'function_response' in part:
             raise exceptions.UnexpectedModelBehavior(
                 f'Unsupported response from Gemini, expected all parts to be function calls or text, got: {part!r}'
@@ -703,7 +701,7 @@ class _GeminiJsonSchema:
 
     def _simplify(self, schema: dict[str, Any], refs_stack: tuple[str, ...]) -> None:
         schema.pop('title', None)
-        schema.pop('default', None)
+        default = schema.pop('default', _utils.UNSET)
         if ref := schema.pop('$ref', None):
             # noinspection PyTypeChecker
             key = re.sub(r'^#/\$defs/', '', ref)
@@ -716,8 +714,14 @@ class _GeminiJsonSchema:
             return
 
         if any_of := schema.get('anyOf'):
-            for schema in any_of:
-                self._simplify(schema, refs_stack)
+            for item_schema in any_of:
+                self._simplify(item_schema, refs_stack)
+            if len(any_of) == 2 and {'type': 'null'} in any_of and default is None:
+                for item_schema in any_of:
+                    if item_schema != {'type': 'null'}:
+                        schema.clear()
+                        schema.update(item_schema)
+                        return
 
         type_ = schema.get('type')
 
